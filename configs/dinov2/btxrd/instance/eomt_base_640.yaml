@@ -1,0 +1,44 @@
+# EoMT-B (DINOv2) on BTXRD: bone tumor segmentation + benign/malignant classification.
+# Annealing/warmup steps assume ~1,300 training images, batch size 8, 40 epochs
+# (~6,500 steps). Rescale them when the dataset size, batch size or epochs change
+# (the Kaggle notebook btxrd_eomt_kaggle.ipynb does this automatically).
+trainer:
+  max_epochs: 40
+  check_val_every_n_epoch: 1
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "btxrd_instance_eomt_base_640"
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_score
+        mode: max
+        save_last: true
+        save_top_k: 1
+        filename: "best-epoch{epoch:02d}"
+        auto_insert_metric_name: false
+model:
+  class_path: training.mask_classification_btxrd.MaskClassificationBTXRD
+  init_args:
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [1080, 2700, 4320]
+    attn_mask_annealing_end_steps: [2160, 3780, 5400]
+    warmup_steps: [200, 400]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 200
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_base_patch14_reg4_dinov2
+data:
+  class_path: datasets.btxrd.BTXRDInstance
+  init_args:
+    batch_size: 8
+    img_size: [640, 640]
+    balanced_sampling: true
