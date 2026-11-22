@@ -1,0 +1,17 @@
+# Extra packages for BTXRD on Colab / Kaggle, where torch and torchvision are preinstalled.
+# Versions pinned as in requirements.txt (which also pins torch for a fresh environment).
+lightning==2.5.1.post0
+jsonargparse[signatures]==4.38
+timm==1.0.15
+transformers==4.56.1
+torchmetrics==1.7.1
+pycocotools==2.0.8
+gitignore_parser==0.1.12
+wandb==0.19.10
+scipy
+matplotlib
+pandas
+openpyxl
+pyyaml
+scikit-learn
+kagglehub

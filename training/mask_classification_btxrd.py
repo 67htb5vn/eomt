@@ -135,6 +135,27 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
         self.dice_all_metric = MeanMetric()  # all images
         self.num_tumor_images = SumMetric()
 
+    def on_fit_start(self):
+        # Annealing steps left empty in the config: derive them from the real
+        # number of training steps (which depends on dataset size, batch size,
+        # number of GPUs and epochs), with the proportions of the project's
+        # COCO/ADE20K configs: one start per masked block spread over
+        # [1/6, 4/6] of training, each lasting 1/6 of training.
+        if self.attn_mask_annealing_enabled and not self.attn_mask_annealing_start_steps:
+            total_steps = self.trainer.estimated_stepping_batches
+            num_blocks = self.network.num_blocks
+            unit = total_steps / 6
+            starts = [
+                round(unit + k * 3 * unit / max(1, num_blocks - 1))
+                for k in range(num_blocks)
+            ]
+            self.attn_mask_annealing_start_steps = starts
+            self.attn_mask_annealing_end_steps = [round(s + unit) for s in starts]
+            rank_zero_info(
+                f"Mask annealing over {total_steps} steps: starts {starts}, "
+                f"ends {self.attn_mask_annealing_end_steps}"
+            )
+
     def forward(self, imgs):
         mask_logits_per_layer, class_logits_per_layer = super().forward(imgs)
         if not self.training:
