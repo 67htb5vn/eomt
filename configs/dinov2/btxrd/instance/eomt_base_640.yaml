@@ -1,7 +1,8 @@
-# EoMT-B (DINOv2) on BTXRD: bone tumor segmentation + benign/malignant classification.
-# Annealing/warmup steps assume ~1,300 training images, batch size 8, 40 epochs
-# (~6,500 steps). Rescale them when the dataset size, batch size or epochs change
-# (the Kaggle notebook btxrd_eomt_kaggle.ipynb does this automatically).
+# EoMT-B (DINOv2) on BTXRD: bone tumor detection + segmentation + benign/malignant
+# classification in one pass. Normal radiographs (no mask) are part of the data.
+# Annealing/warmup steps assume ~2,980 training images (80% of BTXRD), batch size 8,
+# 40 epochs (~14,900 steps). Rescale them when the dataset size, batch size or epochs
+# change (the Kaggle notebook btxrd_eomt_kaggle.ipynb does this automatically).
 trainer:
   max_epochs: 40
   check_val_every_n_epoch: 1
@@ -24,9 +25,10 @@ model:
   class_path: training.mask_classification_btxrd.MaskClassificationBTXRD
   init_args:
     attn_mask_annealing_enabled: True
-    attn_mask_annealing_start_steps: [1080, 2700, 4320]
-    attn_mask_annealing_end_steps: [2160, 3780, 5400]
-    warmup_steps: [200, 400]
+    attn_mask_annealing_start_steps: [2480, 6200, 9920]
+    attn_mask_annealing_end_steps: [4960, 8680, 12400]
+    warmup_steps: [500, 1000]
+    tumor_score_thresh: 0.5
     network:
       class_path: models.eomt.EoMT
       init_args:
@@ -41,4 +43,5 @@ data:
   init_args:
     batch_size: 8
     img_size: [640, 640]
-    balanced_sampling: true
+    check_empty_targets: false  # keep normal images (no tumor)
+    balanced_sampling: true     # normal / benign / malignant sampled equally

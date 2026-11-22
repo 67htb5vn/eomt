@@ -1,16 +1,22 @@
 # ---------------------------------------------------------------
 # BTXRD (Bone Tumor X-ray Radiograph Dataset) data module for EoMT.
 #
-# Bone tumors are cast as an instance segmentation problem with two classes:
-#   0 = benign, 1 = malignant
-# Every tumor polygon in a LabelMe annotation becomes one instance mask whose
-# label is the benign/malignant type of the image. This lets EoMT segment the
-# tumor and classify it as benign or malignant with the same query heads.
+# Tumor detection, segmentation and benign/malignant classification are cast
+# as one instance segmentation problem with two mask classes:
+#   0 = benign, 1 = malignant   (+ the implicit "no object" class of EoMT)
 #
-# Expected folder layout (as in the BTXRD release split into train/val/test):
-#   <path>/split.csv                     image_id,split,type (benign|malignant)
+# - Tumor image: every tumor polygon in its LabelMe file becomes one instance
+#   mask, labelled with the benign/malignant type of the image.
+# - Normal image: no annotation, so the target has zero masks. EoMT then learns
+#   to send all of its queries to "no object" for this image.
+# At inference, an image contains a tumor if at least one query is confident
+# enough; that query's masks give the tumor region and its class gives the
+# benign/malignant label. Detection and segmentation happen in a single pass.
+#
+# Expected folder layout (see tools/split_btxrd.py):
+#   <path>/split.csv                     image_id,split,type (normal|benign|malignant)
 #   <path>/{train,val,test}/images/*.jpeg
-#   <path>/{train,val,test}/Annotations/*.json   (LabelMe format)
+#   <path>/{train,val,test}/Annotations/*.json   (LabelMe, tumor images only)
 # ---------------------------------------------------------------
 
 import csv
@@ -24,32 +30,43 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import tv_tensors
+from torchvision.tv_tensors import wrap
 
 from datasets.lightning_data_module import LightningDataModule
 from datasets.transforms import Transforms
 
+# Mask classes predicted by EoMT (the "no object" class is added by the model).
 CLASS_NAMES = ("benign", "malignant")
-CLASS_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
 
-# Tumor subtypes used as LabelMe labels in BTXRD, mapped to benign/malignant.
+# Image-level labels: what the whole pipeline should output for one radiograph.
+IMAGE_CLASSES = ("normal", "benign", "malignant")
+IMAGE_CLASS_TO_ID = {name: i for i, name in enumerate(IMAGE_CLASSES)}
+NORMAL = IMAGE_CLASS_TO_ID["normal"]
+
+# Tumor subtypes used as LabelMe labels in BTXRD, mapped to image-level labels.
 # Only used as a fallback when the image type is not found in split.csv.
-SUBTYPE_TO_CLASS = {
-    "osteochondroma": 0,
-    "multiple osteochondromas": 0,
-    "simple bone cyst": 0,
-    "giant cell tumor": 0,
-    "osteofibroma": 0,
-    "synovial osteochondroma": 0,
-    "other bt": 0,
-    "osteosarcoma": 1,
-    "other mt": 1,
+SUBTYPE_TO_IMAGE_CLASS = {
+    "osteochondroma": 1,
+    "multiple osteochondromas": 1,
+    "simple bone cyst": 1,
+    "giant cell tumor": 1,
+    "osteofibroma": 1,
+    "synovial osteochondroma": 1,
+    "other bt": 1,
+    "osteosarcoma": 2,
+    "other mt": 2,
 }
 
 IMG_SUFFIXES = (".jpeg", ".jpg", ".png")
 
 
+def mask_class(image_class: int) -> int:
+    """Image-level label (1 benign, 2 malignant) -> EoMT mask class (0, 1)."""
+    return image_class - 1
+
+
 def load_image_types(path: Union[str, Path]) -> dict[str, int]:
-    """Read the benign/malignant type of every image from split.csv."""
+    """Read the image-level type (normal/benign/malignant) of every image from split.csv."""
     csv_path = Path(path, "split.csv")
     types = {}
     if not csv_path.exists():
@@ -58,8 +75,8 @@ def load_image_types(path: Union[str, Path]) -> dict[str, int]:
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             image_type = row.get("type", "").strip().lower()
-            if image_type in CLASS_TO_ID:
-                types[Path(row["image_id"]).stem] = CLASS_TO_ID[image_type]
+            if image_type in IMAGE_CLASS_TO_ID:
+                types[Path(row["image_id"]).stem] = IMAGE_CLASS_TO_ID[image_type]
 
     return types
 
@@ -91,6 +108,30 @@ def load_tumor_shapes(ann_path: Path) -> tuple[list[tuple[list, str]], int, int]
     return polygons, ann.get("imageHeight"), ann.get("imageWidth")
 
 
+class BTXRDTransforms(Transforms):
+    """Project training transforms, extended to images without any mask.
+
+    The base class needs at least one mask (it retries the random crop until a
+    mask survives, and torchvision cannot resize/pad a zero-sized mask tensor).
+    For a normal image we run the same geometric transforms with a full-image
+    dummy mask, then drop it, so the image is augmented in exactly the same way.
+    """
+
+    def forward(self, img, target):
+        if len(target["masks"]) > 0:
+            return super().forward(img, target)
+
+        height, width = img.shape[-2:]
+        dummy = {
+            "masks": tv_tensors.Mask(torch.ones((1, height, width), dtype=torch.bool)),
+            "labels": torch.zeros(1, dtype=torch.long),
+            "is_crowd": torch.zeros(1, dtype=torch.bool),
+        }
+        img, dummy = super().forward(img, dummy)
+
+        return img, {k: wrap(v[:0], like=v) for k, v in dummy.items()}
+
+
 class BTXRDDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -98,7 +139,7 @@ class BTXRDDataset(torch.utils.data.Dataset):
         split: str,
         image_types: dict[str, int],
         transforms: Optional[torch.nn.Module] = None,
-        check_empty_targets: bool = True,
+        include_normal: bool = True,
     ):
         self.root = Path(root)
         self.split = split
@@ -109,7 +150,8 @@ class BTXRDDataset(torch.utils.data.Dataset):
         if not img_dir.is_dir():
             raise FileNotFoundError(f"Image folder not found: {img_dir}")
 
-        self.samples: list[tuple[Path, Path, int]] = []
+        # (image path, annotation path or None, image-level label)
+        self.samples: list[tuple[Path, Optional[Path], int]] = []
         skipped = Counter()
 
         for img_path in sorted(img_dir.iterdir()):
@@ -117,23 +159,27 @@ class BTXRDDataset(torch.utils.data.Dataset):
                 continue
 
             ann_path = ann_dir / f"{img_path.stem}.json"
-            if not ann_path.exists():
-                skipped["no annotation"] += 1
-                continue
+            polygons = load_tumor_shapes(ann_path)[0] if ann_path.exists() else []
 
-            polygons, _, _ = load_tumor_shapes(ann_path)
-            if check_empty_targets and not polygons:
-                skipped["no tumor shape"] += 1
-                continue
-
-            cls_id = image_types.get(img_path.stem)
-            if cls_id is None and polygons:
-                cls_id = SUBTYPE_TO_CLASS.get(polygons[0][1])
-            if cls_id is None:
+            image_class = image_types.get(img_path.stem)
+            if image_class is None and polygons:
+                image_class = SUBTYPE_TO_IMAGE_CLASS.get(polygons[0][1])
+            if image_class is None:
                 skipped["unknown type"] += 1
                 continue
 
-            self.samples.append((img_path, ann_path, cls_id))
+            if image_class == NORMAL:
+                if include_normal:
+                    self.samples.append((img_path, None, NORMAL))
+                else:
+                    skipped["normal (excluded)"] += 1
+                continue
+
+            if not polygons:
+                skipped["tumor without polygon"] += 1
+                continue
+
+            self.samples.append((img_path, ann_path, image_class))
 
         if skipped:
             logging.info(f"BTXRD/{split}: skipped {dict(skipped)}")
@@ -143,7 +189,8 @@ class BTXRDDataset(torch.utils.data.Dataset):
 
     @property
     def class_ids(self) -> list[int]:
-        return [cls_id for _, _, cls_id in self.samples]
+        """Image-level label of every sample (0 normal, 1 benign, 2 malignant)."""
+        return [image_class for _, _, image_class in self.samples]
 
     @staticmethod
     def rasterize(polygons, ann_h, ann_w, height, width) -> list[torch.Tensor]:
@@ -165,31 +212,43 @@ class BTXRDDataset(torch.utils.data.Dataset):
         return masks
 
     def __getitem__(self, index: int):
-        img_path, ann_path, cls_id = self.samples[index]
+        img_path, ann_path, image_class = self.samples[index]
 
         with Image.open(img_path) as pil_img:
             img = tv_tensors.Image(pil_img.convert("RGB"))
 
         height, width = img.shape[-2:]
-        polygons, ann_h, ann_w = load_tumor_shapes(ann_path)
-        masks = self.rasterize(polygons, ann_h, ann_w, height, width)
+        masks = []
+        if ann_path is not None:
+            polygons, ann_h, ann_w = load_tumor_shapes(ann_path)
+            masks = self.rasterize(polygons, ann_h, ann_w, height, width)
+            if not masks and self.transforms is not None:
+                # Tumor image whose polygons are degenerate: do not train on it
+                # as if it were normal.
+                return self[(index + 1) % len(self)]
 
         if masks:
             masks = torch.stack(masks)
-        elif self.transforms is not None:
-            # Degenerate polygons: training transforms need at least one mask.
-            return self[(index + 1) % len(self)]
         else:
             masks = torch.zeros((0, height, width), dtype=torch.bool)
 
+        labels = (
+            torch.full((len(masks),), mask_class(image_class), dtype=torch.long)
+            if image_class != NORMAL
+            else torch.zeros(0, dtype=torch.long)
+        )
         target = {
             "masks": tv_tensors.Mask(masks),
-            "labels": torch.full((len(masks),), cls_id, dtype=torch.long),
+            "labels": labels,
             "is_crowd": torch.zeros(len(masks), dtype=torch.bool),
         }
 
         if self.transforms is not None:
             img, target = self.transforms(img, target)
+
+        # Image-level ground truth for the detection / classification metrics.
+        # Added after the transforms, which filter every per-mask entry.
+        target["image_label"] = torch.tensor(image_class, dtype=torch.long)
 
         return img, target
 
@@ -207,9 +266,17 @@ class BTXRDInstance(LightningDataModule):
         num_classes: int = 2,
         color_jitter_enabled: bool = True,
         scale_range: tuple[float, float] = (0.5, 1.5),
-        check_empty_targets: bool = True,
+        check_empty_targets: bool = False,
         balanced_sampling: bool = False,
     ) -> None:
+        """
+        Args:
+            check_empty_targets: True drops the normal images (no mask), which
+                turns the task back into segmentation + classification of
+                tumor images only. Keep False for detection + segmentation.
+            balanced_sampling: sample normal / benign / malignant images with
+                equal probability during training.
+        """
         super().__init__(
             path=path,
             batch_size=batch_size,
@@ -222,8 +289,9 @@ class BTXRDInstance(LightningDataModule):
 
         self.balanced_sampling = balanced_sampling
         self.class_names = CLASS_NAMES
+        self.image_class_names = IMAGE_CLASSES
 
-        self.transforms = Transforms(
+        self.transforms = BTXRDTransforms(
             img_size=img_size,
             color_jitter_enabled=color_jitter_enabled,
             scale_range=scale_range,
@@ -234,7 +302,7 @@ class BTXRDInstance(LightningDataModule):
         dataset_kwargs = {
             "root": self.path,
             "image_types": image_types,
-            "check_empty_targets": self.check_empty_targets,
+            "include_normal": not self.check_empty_targets,
         }
 
         self.train_dataset = BTXRDDataset(

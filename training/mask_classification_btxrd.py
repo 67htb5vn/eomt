@@ -1,11 +1,25 @@
 # ---------------------------------------------------------------
-# EoMT for bone tumor segmentation + benign/malignant classification (BTXRD).
+# EoMT for bone tumor detection + segmentation + benign/malignant
+# classification on BTXRD, in a single forward pass.
 #
-# Extends MaskClassificationInstance (mask AP per layer) with metrics that
-# matter clinically, computed on the final layer:
-#   - tumor segmentation: Dice and IoU of the predicted tumor region
-#   - image-level classification (malignant = positive): accuracy, balanced
-#     accuracy, AUROC, F1, sensitivity, specificity
+# Model, loss, optimizer, schedule and mask-AP evaluation are the project's own
+# (MaskClassificationInstance). Normal radiographs are targets with zero masks:
+# the project's loss then trains all queries towards "no object".
+#
+# This subclass only adds the BTXRD read-out of the final layer and its metrics.
+# For one radiograph:
+#   tumor score  = max over queries of P(benign) + P(malignant)
+#   has tumor    = tumor score > tumor_score_thresh
+#   tumor region = union of the masks of all queries above the threshold
+#                  (empty when no tumor is detected)
+#   P(malignant) = P(malignant) / P(tumor) of the most confident query
+# Metrics:
+#   - detection (tumor = positive, all images): acc, balanced acc, AUROC, F1,
+#     sensitivity, specificity
+#   - segmentation: Dice / IoU on tumor images, Dice over all images
+#     (an empty prediction on a normal image counts as Dice 1)
+#   - benign/malignant classification (malignant = positive, tumor images)
+#   - 3-class image accuracy (normal / benign / malignant)
 # It also adds test_step so `python main.py test` works on the test split.
 # ---------------------------------------------------------------
 
@@ -15,17 +29,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lightning.fabric.utilities import rank_zero_info
-from torchmetrics import MeanMetric, MetricCollection
+from torchmetrics import MeanMetric, MetricCollection, SumMetric
 from torchmetrics.classification import (
     BinaryAccuracy,
     BinaryAUROC,
     BinaryF1Score,
     BinaryRecall,
     BinarySpecificity,
+    MulticlassAccuracy,
 )
 
 from training.mask_classification_instance import MaskClassificationInstance
 from training.lightning_module import bold_green, reset
+
+
+def binary_metrics() -> MetricCollection:
+    return MetricCollection(
+        {
+            "acc": BinaryAccuracy(),
+            "auroc": BinaryAUROC(),
+            "f1": BinaryF1Score(),
+            "sensitivity": BinaryRecall(),
+            "specificity": BinarySpecificity(),
+        }
+    )
 
 
 class MaskClassificationBTXRD(MaskClassificationInstance):
@@ -55,6 +82,7 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
         overlap_thresh: float = 0.8,
         eval_top_k_instances: int = 100,
         tumor_score_thresh: float = 0.5,
+        malignant_thresh: float = 0.5,
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
@@ -92,21 +120,32 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
             raise ValueError("BTXRD expects num_classes=2 (benign, malignant)")
 
         self.tumor_score_thresh = tumor_score_thresh
+        self.malignant_thresh = malignant_thresh
 
-        self.cls_metrics = MetricCollection(
+        self.det_metrics = binary_metrics()  # tumor vs normal, all images
+        self.cls_metrics = binary_metrics()  # malignant vs benign, tumor images
+        self.img_metrics = MetricCollection(
             {
-                "acc": BinaryAccuracy(),
-                "auroc": BinaryAUROC(),
-                "f1": BinaryF1Score(),
-                "sensitivity": BinaryRecall(),
-                "specificity": BinarySpecificity(),
+                "acc": MulticlassAccuracy(num_classes=3, average="micro"),
+                "balanced_acc": MulticlassAccuracy(num_classes=3, average="macro"),
             }
         )
-        self.dice_metric = MeanMetric()
-        self.iou_metric = MeanMetric()
+        self.dice_metric = MeanMetric()  # tumor images
+        self.iou_metric = MeanMetric()  # tumor images
+        self.dice_all_metric = MeanMetric()  # all images
+        self.num_tumor_images = SumMetric()
+
+    def forward(self, imgs):
+        mask_logits_per_layer, class_logits_per_layer = super().forward(imgs)
+        if not self.training:
+            # Final-layer outputs, reused by eval_step after the project's evaluation
+            self._eval_outputs = (mask_logits_per_layer[-1], class_logits_per_layer[-1])
+        return mask_logits_per_layer, class_logits_per_layer
 
     @staticmethod
-    def predict_btxrd(mask_logits, class_logits, tumor_score_thresh=0.5):
+    def predict_btxrd(
+        mask_logits, class_logits, tumor_score_thresh=0.5, malignant_thresh=0.5
+    ):
         """Turn the query outputs of one image into BTXRD predictions.
 
         Args:
@@ -114,137 +153,144 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
             class_logits: (Q, num_classes + 1) class logits.
 
         Returns:
-            tumor_mask: (H, W) bool, union of the masks of all confident tumor
-                queries (the most confident query is always kept).
-            malignant_prob: scalar, P(malignant | tumor) of the top query.
-            top_query: index of the most confident tumor query.
+            tumor_mask: (H, W) bool, union of the masks of the queries whose
+                tumor score exceeds the threshold; all False if none does.
+            tumor_prob: scalar, tumor score of the most confident query
+                (image-level detection score).
+            malignant_prob: scalar, P(malignant | tumor) of that query.
+            image_pred: 0 normal, 1 benign, 2 malignant.
         """
         probs = class_logits.float().softmax(dim=-1)
         tumor_scores = probs[:, :-1].sum(dim=-1)
         top_query = tumor_scores.argmax()
+        tumor_prob = tumor_scores[top_query]
 
-        malignant_prob = probs[top_query, 1] / tumor_scores[top_query].clamp_min(1e-6)
+        malignant_prob = probs[top_query, 1] / tumor_prob.clamp_min(1e-6)
 
         keep = tumor_scores > tumor_score_thresh
-        keep[top_query] = True
         tumor_mask = (mask_logits[keep] > 0).any(dim=0)
 
-        return tumor_mask, malignant_prob, top_query
+        image_pred = torch.where(
+            tumor_prob > tumor_score_thresh,
+            1 + (malignant_prob >= malignant_thresh).long(),
+            torch.zeros_like(top_query),
+        )
+
+        return tumor_mask, tumor_prob, malignant_prob, image_pred
 
     @torch.compiler.disable
     def update_metrics_btxrd(self, mask_logits, class_logits, targets):
         for j in range(len(mask_logits)):
-            tumor_mask, malignant_prob, _ = self.predict_btxrd(
-                mask_logits[j], class_logits[j], self.tumor_score_thresh
+            tumor_mask, tumor_prob, malignant_prob, image_pred = self.predict_btxrd(
+                mask_logits[j],
+                class_logits[j],
+                self.tumor_score_thresh,
+                self.malignant_thresh,
             )
 
+            image_label = targets[j]["image_label"]
+            has_tumor = image_label > 0
             gt_mask = targets[j]["masks"].bool().any(dim=0)
-            gt_malignant = (targets[j]["labels"] == 1).any().long()
+
+            self.det_metrics.update(tumor_prob[None], has_tumor.long()[None])
+            self.img_metrics.update(image_pred[None], image_label[None])
 
             inter = (tumor_mask & gt_mask).sum().float()
-            pred_area = tumor_mask.sum().float()
-            gt_area = gt_mask.sum().float()
+            area_sum = (tumor_mask.sum() + gt_mask.sum()).float()
             union = (tumor_mask | gt_mask).sum().float()
+            dice = 2 * inter / area_sum if area_sum > 0 else torch.ones_like(inter)
+            self.dice_all_metric.update(dice)
 
-            self.dice_metric.update(2 * inter / (pred_area + gt_area).clamp_min(1))
-            self.iou_metric.update(inter / union.clamp_min(1))
-            self.cls_metrics.update(malignant_prob[None], gt_malignant[None])
+            if has_tumor and gt_mask.any():
+                self.dice_metric.update(dice)
+                self.iou_metric.update(inter / union.clamp_min(1))
+                self.cls_metrics.update(
+                    malignant_prob[None], (image_label == 2).long()[None]
+                )
+                self.num_tumor_images.update(1.0)
 
-    def eval_step(
-        self,
-        batch,
-        batch_idx=None,
-        log_prefix=None,
-    ):
+    def eval_step(self, batch, batch_idx=None, log_prefix=None):
+        # Project's evaluation, unchanged: forward pass + mask AP for every layer
+        super().eval_step(batch, batch_idx, log_prefix)
+
+        # BTXRD read-out of the same forward pass (final layer)
         imgs, targets = batch
-
-        img_sizes = [img.shape[-2:] for img in imgs]
-        transformed_imgs = self.resize_and_pad_imgs_instance_panoptic(imgs)
-        mask_logits_per_layer, class_logits_per_layer = self(transformed_imgs)
-        last_layer = len(mask_logits_per_layer) - 1
-
-        for i, (mask_logits, class_logits) in enumerate(
-            list(zip(mask_logits_per_layer, class_logits_per_layer))
-        ):
-            mask_logits = F.interpolate(mask_logits, self.img_size, mode="bilinear")
-            mask_logits = self.revert_resize_and_pad_logits_instance_panoptic(
-                mask_logits, img_sizes
-            )
-
-            if i == last_layer:
-                self.update_metrics_btxrd(mask_logits, class_logits, targets)
-
-            # Same mask-AP evaluation as MaskClassificationInstance.eval_step
-            preds, targets_ = [], []
-            for j in range(len(mask_logits)):
-                scores = class_logits[j].softmax(dim=-1)[:, :-1]
-                labels = (
-                    torch.arange(scores.shape[-1], device=self.device)
-                    .unsqueeze(0)
-                    .repeat(scores.shape[0], 1)
-                    .flatten(0, 1)
-                )
-
-                topk_scores, topk_indices = scores.flatten(0, 1).topk(
-                    min(self.eval_top_k_instances, scores.numel()), sorted=False
-                )
-                labels = labels[topk_indices]
-
-                topk_indices = topk_indices // scores.shape[-1]
-                layer_mask_logits = mask_logits[j][topk_indices]
-
-                masks = layer_mask_logits > 0
-                mask_scores = (
-                    layer_mask_logits.sigmoid().flatten(1) * masks.flatten(1)
-                ).sum(1) / (masks.flatten(1).sum(1) + 1e-6)
-                scores = topk_scores * mask_scores
-
-                preds.append(dict(masks=masks, labels=labels, scores=scores))
-                targets_.append(
-                    dict(
-                        masks=targets[j]["masks"],
-                        labels=targets[j]["labels"],
-                        iscrowd=targets[j]["is_crowd"],
-                    )
-                )
-
-            self.update_metrics_instance(preds, targets_, i)
+        mask_logits, class_logits = self._eval_outputs
+        mask_logits = F.interpolate(mask_logits, self.img_size, mode="bilinear")
+        mask_logits = self.revert_resize_and_pad_logits_instance_panoptic(
+            mask_logits, [img.shape[-2:] for img in imgs]
+        )
+        self.update_metrics_btxrd(mask_logits, class_logits, targets)
 
     def test_step(self, batch, batch_idx=0):
         return self.eval_step(batch, batch_idx, "test")
 
+    def _log_binary(self, metrics, name, log_prefix, valid=True):
+        results = metrics.compute() if valid else {}
+        metrics.reset()
+        nan = torch.tensor(float("nan"), device=self.device)
+        for key in ("acc", "auroc", "f1", "sensitivity", "specificity"):
+            self.log(f"metrics/{log_prefix}_{name}_{key}", results.get(key, nan))
+        balanced = (
+            (results["sensitivity"] + results["specificity"]) / 2 if valid else nan
+        )
+        self.log(f"metrics/{log_prefix}_{name}_balanced_acc", balanced)
+        return results.get("auroc", nan)
+
     def _on_eval_epoch_end_btxrd(self, log_prefix):
-        cls_results = self.cls_metrics.compute()
-        self.cls_metrics.reset()
-        for name, value in cls_results.items():
-            self.log(f"metrics/{log_prefix}_cls_{name}", value)
+        # SumMetric.compute is synced across ranks, so every rank takes the
+        # same branch below (metric computes are collective under DDP).
+        has_tumor_images = bool(self.num_tumor_images.compute() > 0)
+        self.num_tumor_images.reset()
 
-        balanced_acc = (cls_results["sensitivity"] + cls_results["specificity"]) / 2
-        self.log(f"metrics/{log_prefix}_cls_balanced_acc", balanced_acc)
+        det_auroc = self._log_binary(self.det_metrics, "det", log_prefix)
+        cls_auroc = self._log_binary(
+            self.cls_metrics, "cls", log_prefix, valid=has_tumor_images
+        )
 
-        dice = self.dice_metric.compute()
-        iou = self.iou_metric.compute()
+        img_results = self.img_metrics.compute()
+        self.img_metrics.reset()
+        for key, value in img_results.items():
+            self.log(f"metrics/{log_prefix}_img3_{key}", value)
+
+        dice_all = self.dice_all_metric.compute()
+        self.dice_all_metric.reset()
+        self.log(f"metrics/{log_prefix}_dice_all", dice_all)
+
+        if has_tumor_images:
+            dice = self.dice_metric.compute()
+            iou = self.iou_metric.compute()
+        else:
+            dice = iou = torch.tensor(float("nan"), device=self.device)
         self.dice_metric.reset()
         self.iou_metric.reset()
         self.log(f"metrics/{log_prefix}_dice", dice)
         self.log(f"metrics/{log_prefix}_iou", iou)
 
-        # Single number for checkpoint selection: segmentation + classification
-        self.log(f"metrics/{log_prefix}_score", (dice + cls_results["auroc"]) / 2)
+        # Single number for checkpoint selection: detection + segmentation +
+        # benign/malignant classification
+        self.log(f"metrics/{log_prefix}_score", (det_auroc + dice + cls_auroc) / 3)
 
     def _on_eval_end_btxrd(self, log_prefix):
         if self.trainer.sanity_checking:
             return
 
         m = self.trainer.callback_metrics
+        p = f"metrics/{log_prefix}"
         rank_zero_info(
-            f"{bold_green}Dice: {m[f'metrics/{log_prefix}_dice'] * 100:.1f} | "
-            f"IoU: {m[f'metrics/{log_prefix}_iou'] * 100:.1f} | "
-            f"Acc: {m[f'metrics/{log_prefix}_cls_acc'] * 100:.1f} | "
-            f"Bal. Acc: {m[f'metrics/{log_prefix}_cls_balanced_acc'] * 100:.1f} | "
-            f"AUROC: {m[f'metrics/{log_prefix}_cls_auroc'] * 100:.1f} | "
-            f"Sens: {m[f'metrics/{log_prefix}_cls_sensitivity'] * 100:.1f} | "
-            f"Spec: {m[f'metrics/{log_prefix}_cls_specificity'] * 100:.1f}{reset}"
+            f"{bold_green}Detection  | AUROC: {m[f'{p}_det_auroc'] * 100:.1f} | "
+            f"Sens: {m[f'{p}_det_sensitivity'] * 100:.1f} | "
+            f"Spec: {m[f'{p}_det_specificity'] * 100:.1f} | "
+            f"Bal. Acc: {m[f'{p}_det_balanced_acc'] * 100:.1f}\n"
+            f"Segmentation | Dice: {m[f'{p}_dice'] * 100:.1f} | "
+            f"IoU: {m[f'{p}_iou'] * 100:.1f} | "
+            f"Dice (all images): {m[f'{p}_dice_all'] * 100:.1f}\n"
+            f"Benign/Malignant | AUROC: {m[f'{p}_cls_auroc'] * 100:.1f} | "
+            f"Sens: {m[f'{p}_cls_sensitivity'] * 100:.1f} | "
+            f"Spec: {m[f'{p}_cls_specificity'] * 100:.1f} | "
+            f"Bal. Acc: {m[f'{p}_cls_balanced_acc'] * 100:.1f}\n"
+            f"3-class (normal/benign/malignant) | Acc: {m[f'{p}_img3_acc'] * 100:.1f} | "
+            f"Bal. Acc: {m[f'{p}_img3_balanced_acc'] * 100:.1f}{reset}"
         )
 
     def on_validation_epoch_end(self):
