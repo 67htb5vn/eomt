@@ -178,3 +178,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# BTXRD local notebook (btxrd_eomt_merged_local.ipynb): data cache, downloaded weights, results
+btxrd_cache/
+pretrained/
+eomt_results/
+BTXRD_full_split/
+BTXRD_full_split.zip
