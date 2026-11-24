@@ -21,6 +21,12 @@
 #   - benign/malignant classification (malignant = positive, tumor images)
 #   - 3-class image accuracy (normal / benign / malignant)
 # It also adds test_step so `python main.py test` works on the test split.
+#
+# val_mask_ap=False skips the project's mask AP during validation only (it is
+# not part of metrics/val_score, which selects the checkpoint, and encoding
+# 100 full-resolution masks x 4 layers per image on the CPU dominates the
+# validation time). The forward pass and all BTXRD metrics are unchanged, and
+# `main.py test` still computes mask AP.
 # ---------------------------------------------------------------
 
 
@@ -83,6 +89,7 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
         eval_top_k_instances: int = 100,
         tumor_score_thresh: float = 0.5,
         malignant_thresh: float = 0.5,
+        val_mask_ap: bool = True,
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
@@ -121,6 +128,7 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
 
         self.tumor_score_thresh = tumor_score_thresh
         self.malignant_thresh = malignant_thresh
+        self.val_mask_ap = val_mask_ap
 
         self.det_metrics = binary_metrics()  # tumor vs normal, all images
         self.cls_metrics = binary_metrics()  # malignant vs benign, tumor images
@@ -230,12 +238,19 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
                 )
                 self.num_tumor_images.update(1.0)
 
+    def _skip_mask_ap(self, log_prefix):
+        return log_prefix == "val" and not self.val_mask_ap
+
     def eval_step(self, batch, batch_idx=None, log_prefix=None):
-        # Project's evaluation, unchanged: forward pass + mask AP for every layer
-        super().eval_step(batch, batch_idx, log_prefix)
+        imgs, targets = batch
+        if self._skip_mask_ap(log_prefix):
+            # Same forward pass as the project's eval_step, without mask AP
+            self(self.resize_and_pad_imgs_instance_panoptic(imgs))
+        else:
+            # Project's evaluation, unchanged: forward pass + mask AP for every layer
+            super().eval_step(batch, batch_idx, log_prefix)
 
         # BTXRD read-out of the same forward pass (final layer)
-        imgs, targets = batch
         mask_logits, class_logits = self._eval_outputs
         mask_logits = F.interpolate(mask_logits, self.img_size, mode="bilinear")
         mask_logits = self.revert_resize_and_pad_logits_instance_panoptic(
@@ -315,11 +330,13 @@ class MaskClassificationBTXRD(MaskClassificationInstance):
         )
 
     def on_validation_epoch_end(self):
-        self._on_eval_epoch_end_instance("val")
+        if not self._skip_mask_ap("val"):
+            self._on_eval_epoch_end_instance("val")
         self._on_eval_epoch_end_btxrd("val")
 
     def on_validation_end(self):
-        self._on_eval_end_instance("val")
+        if not self._skip_mask_ap("val"):
+            self._on_eval_end_instance("val")
         self._on_eval_end_btxrd("val")
 
     def on_test_epoch_end(self):
